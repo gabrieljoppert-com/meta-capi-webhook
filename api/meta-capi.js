@@ -14,6 +14,15 @@
  * envia o evento Purchase para a Meta via API de Conversões — cobrindo
  * o gap.
  *
+ * IMPORTANTE — DUPLICAÇÃO EM PEDIDOS PIX:
+ * "orders/paid" dispara para QUALQUER pedido que fica pago, inclusive PIX
+ * — que JÁ é rastreado nativamente (pixel dispara na página de confirmação
+ * do checkout). Confirmado via API: nesta loja só existem 2 gateways,
+ * "PIX" e "Parcelamento" (payment_gateway_names). Por isso este webhook
+ * IGNORA pedidos com gateway "PIX" (já cobertos pelo canal nativo) e só
+ * envia para a Meta os que não passaram pela tela de confirmação da
+ * Shopify — hoje, isso é "Parcelamento". Ver SKIP_GATEWAYS abaixo.
+ *
  * DEPLOY (qualquer opção serve, é só uma function HTTP):
  *   - Vercel: crie um projeto, coloque este arquivo em /api/meta-capi.js,
  *     "vercel deploy". A URL fica algo como
@@ -55,6 +64,11 @@ const ACCESS_TOKEN = process.env.META_CAPI_ACCESS_TOKEN;
 const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE; // opcional
 const GRAPH_VERSION = 'v21.0';
+
+// Gateways já rastreados pelo canal nativo Shopify->Meta (pixel dispara na
+// página de confirmação do checkout) — pedidos com esses gateways são
+// ignorados aqui para não duplicar o Purchase na Meta.
+const SKIP_GATEWAYS = ['pix'];
 
 // Desativa o parse automático de body da Vercel — precisamos do raw exato
 // para validar a assinatura HMAC da Shopify corretamente.
@@ -132,10 +146,8 @@ function buildPurchaseEvent(order) {
     external_id: sha256(externalId),
   };
 
-  // fbc/fbp: se você salvar esses cookies como "note attributes" do pedido
-  // no momento do checkout (via um pequeno script no tema), pode reenviá-los
-  // aqui para melhorar MUITO a qualidade de correspondência. Ver seção
-  // "Melhoria opcional" no final do arquivo.
+  // fbc/fbp: capturados no tema (layout/theme.liquid) e propagados como
+  // note_attributes do pedido — ver nota no final do arquivo.
   const fbp = order?.note_attributes?.find((a) => a.name === '_fbp')?.value;
   const fbc = order?.note_attributes?.find((a) => a.name === '_fbc')?.value;
   if (fbp) userData.fbp = fbp;
@@ -151,7 +163,7 @@ function buildPurchaseEvent(order) {
     event_name: 'Purchase',
     event_time: Math.floor(new Date(order.processed_at || order.created_at).getTime() / 1000),
     action_source: 'website',
-    event_source_url: `https://liviaribeiro.com/checkouts/order/${order.order_status_url ? '' : ''}`.replace(/\/$/, ''),
+    event_source_url: order?.order_status_url || 'https://liviaribeiro.com/',
     user_data: userData,
     custom_data: {
       currency: order?.currency || 'BRL',
@@ -216,6 +228,14 @@ module.exports = async function handler(req, res) {
       return;
     }
 
+    // Evita duplicar Purchase para gateways já cobertos pelo canal nativo
+    // Shopify->Meta (ex: PIX). Ver nota no topo do arquivo.
+    const gateways = (order.payment_gateway_names || []).map((g) => String(g).toLowerCase());
+    if (gateways.some((g) => SKIP_GATEWAYS.includes(g))) {
+      res.status(200).send('Ignorado: gateway já rastreado pelo canal nativo (' + gateways.join(', ') + ')');
+      return;
+    }
+
     const event = buildPurchaseEvent(order);
     const result = await sendToMetaCapi(event);
 
@@ -228,13 +248,10 @@ module.exports = async function handler(req, res) {
 };
 
 /**
- * MELHORIA OPCIONAL (recomendada, mas não bloqueante):
- * Capturar _fbp e _fbc no checkout e salvar como note_attributes do pedido,
- * para reenviar aqui como user_data.fbp / user_data.fbc. Isso aumenta muito
- * a taxa de correspondência (hoje o pixel está em 6.0/10, meta é 7.66+).
- * Sem isso, o evento ainda funciona e conta para o volume de conversão,
- * só a atribuição direta a um clique de anúncio específico fica mais fraca
- * (mas isso já é uma melhoria enorme em relação a não enviar nada).
+ * CAPTURA DE _fbp/_fbc: implementada em 08/08/2026 via script em
+ * layout/theme.liquid, que salva os cookies _fbp/_fbc como atributos do
+ * carrinho (propagam para note_attributes do pedido automaticamente).
+ * Esta função já lê esses valores acima (user_data.fbp / user_data.fbc).
  *
  * TESTE ANTES DE ATIVAR EM PRODUÇÃO:
  * 1. Gere um Test Event Code em Events Manager > Pixel > Eventos de teste.
