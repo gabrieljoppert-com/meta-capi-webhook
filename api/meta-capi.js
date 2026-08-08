@@ -14,14 +14,20 @@
  * envia o evento Purchase para a Meta via API de Conversões — cobrindo
  * o gap.
  *
- * IMPORTANTE — DUPLICAÇÃO EM PEDIDOS PIX:
- * "orders/paid" dispara para QUALQUER pedido que fica pago, inclusive PIX
- * — que JÁ é rastreado nativamente (pixel dispara na página de confirmação
- * do checkout). Confirmado via API: nesta loja só existem 2 gateways,
- * "PIX" e "Parcelamento" (payment_gateway_names). Por isso este webhook
- * IGNORA pedidos com gateway "PIX" (já cobertos pelo canal nativo) e só
- * envia para a Meta os que não passaram pela tela de confirmação da
- * Shopify — hoje, isso é "Parcelamento". Ver SKIP_GATEWAYS abaixo.
+ * SOBRE PIX (corrigido em 08/08/2026 com dados reais de pedidos):
+ * A primeira versão deste webhook ignorava pedidos PIX, supondo que o
+ * canal nativo Shopify->Meta (pixel na página de confirmação) já cobria
+ * PIX porque ele "nasce pago". Checando as transações reais dos últimos
+ * pedidos PIX na Shopify, isso NÃO se confirmou: o PIX geralmente fica
+ * "pending" e só vira "SUCCESS" minutos ou até 1+ dia depois (o cliente
+ * gera o QR code, sai da tela, paga pelo banco). Ou seja, na hora em que
+ * o pagamento é confirmado, o navegador do cliente quase sempre já não
+ * está mais na tela de confirmação — o pixel nativo não dispara. PIX tem
+ * o MESMO problema que o Parcelamento. Por isso este webhook cobre os
+ * dois gateways ("PIX" e "Parcelamento"), sem pular nenhum — ver
+ * SKIP_GATEWAYS abaixo (mantido vazio, mas pronto para uso se um dia
+ * entrar um gateway realmente síncrono, tipo cartão à vista aprovado na
+ * hora).
  *
  * DEPLOY (qualquer opção serve, é só uma function HTTP):
  *   - Vercel: crie um projeto, coloque este arquivo em /api/meta-capi.js,
@@ -65,10 +71,12 @@ const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE; // opcional
 const GRAPH_VERSION = 'v21.0';
 
-// Gateways já rastreados pelo canal nativo Shopify->Meta (pixel dispara na
-// página de confirmação do checkout) — pedidos com esses gateways são
-// ignorados aqui para não duplicar o Purchase na Meta.
-const SKIP_GATEWAYS = ['pix'];
+// Gateways que JÁ são cobertos com segurança pelo canal nativo Shopify->Meta
+// (confirmação síncrona, pixel dispara na própria tela de checkout) — hoje
+// nenhum gateway desta loja se encaixa nisso (ver nota no topo do arquivo).
+// Mantido vazio de propósito; existe para o caso de um gateway realmente
+// síncrono entrar no futuro.
+const SKIP_GATEWAYS = [];
 
 // Desativa o parse automático de body da Vercel — precisamos do raw exato
 // para validar a assinatura HMAC da Shopify corretamente.
@@ -228,8 +236,8 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    // Evita duplicar Purchase para gateways já cobertos pelo canal nativo
-    // Shopify->Meta (ex: PIX). Ver nota no topo do arquivo.
+    // Pula gateways listados em SKIP_GATEWAYS (hoje vazio — ver nota no topo
+    // do arquivo sobre por que PIX também precisa passar por aqui).
     const gateways = (order.payment_gateway_names || []).map((g) => String(g).toLowerCase());
     if (gateways.some((g) => SKIP_GATEWAYS.includes(g))) {
       res.status(200).send('Ignorado: gateway já rastreado pelo canal nativo (' + gateways.join(', ') + ')');
