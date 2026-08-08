@@ -38,6 +38,13 @@
  *   META_TEST_EVENT_CODE       = opcional, só para testar em
  *                                 Events Manager > Eventos de teste antes
  *                                 de ativar em produção (remover depois)
+ *
+ * IMPORTANTE (Vercel): para validar a assinatura HMAC da Shopify é
+ * necessário o corpo RAW exato, byte a byte, tal como a Shopify o
+ * assinou. A Vercel, por padrão, faz parse automático do JSON e não
+ * expõe req.rawBody nas funções Node.js "puras" (sem framework) — por
+ * isso desativamos o bodyParser via "config.api.bodyParser = false" e
+ * lemos o corpo manualmente do stream, ANTES de qualquer JSON.parse.
  */
 
 const crypto = require('crypto');
@@ -48,6 +55,24 @@ const ACCESS_TOKEN = process.env.META_CAPI_ACCESS_TOKEN;
 const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const TEST_EVENT_CODE = process.env.META_TEST_EVENT_CODE; // opcional
 const GRAPH_VERSION = 'v21.0';
+
+// Desativa o parse automático de body da Vercel — precisamos do raw exato
+// para validar a assinatura HMAC da Shopify corretamente.
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+// Lê o corpo cru da requisição a partir do stream, antes de qualquer parse.
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
 
 function sha256(value) {
   if (!value) return undefined;
@@ -69,13 +94,17 @@ function normalizePhone(raw, defaultCountryCode = '55') {
   return withCountry;
 }
 
-function verifyShopifyHmac(rawBody, hmacHeader) {
+function verifyShopifyHmac(rawBodyBuffer, hmacHeader) {
   if (!WEBHOOK_SECRET) return true; // sem secret configurado, pula validação (não recomendado em produção)
+  if (!hmacHeader) return false;
   const digest = crypto
     .createHmac('sha256', WEBHOOK_SECRET)
-    .update(rawBody, 'utf8')
+    .update(rawBodyBuffer)
     .digest('base64');
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || ''));
+  const digestBuf = Buffer.from(digest);
+  const headerBuf = Buffer.from(hmacHeader);
+  if (digestBuf.length !== headerBuf.length) return false;
+  return crypto.timingSafeEqual(digestBuf, headerBuf);
 }
 
 function buildPurchaseEvent(order) {
@@ -162,7 +191,6 @@ async function sendToMetaCapi(event) {
 }
 
 // ---- Handler HTTP (formato Vercel/Node genérico) ----
-// Adaptar a assinatura conforme a plataforma de deploy escolhida.
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).send('Method not allowed');
@@ -170,17 +198,17 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // Importante: para validar o HMAC corretamente é preciso o corpo RAW,
-    // antes de qualquer parse automático de JSON pelo framework.
-    const rawBody = req.rawBody || JSON.stringify(req.body);
+    // Corpo RAW exato (bodyParser desativado acima via module.exports.config),
+    // necessário para validar o HMAC corretamente.
+    const rawBodyBuffer = await getRawBody(req);
     const hmacHeader = req.headers['x-shopify-hmac-sha256'];
 
-    if (!verifyShopifyHmac(rawBody, hmacHeader)) {
+    if (!verifyShopifyHmac(rawBodyBuffer, hmacHeader)) {
       res.status(401).send('Assinatura inválida');
       return;
     }
 
-    const order = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const order = JSON.parse(rawBodyBuffer.toString('utf8'));
 
     // Só processa se o pedido de fato está pago (financial_status == paid)
     if (order.financial_status !== 'paid') {
